@@ -1,0 +1,184 @@
+import jsPDF from "jspdf";
+import QRCode from "qrcode";
+import { supabase } from "@/integrations/supabase/client";
+
+export const DOC_TEMPLATE_CODES = [
+  "TPL-KYC",
+  "TPL-IDCARD",
+  "TPL-ADV-REQ",
+  "TPL-ADV-APR",
+  "TPL-WARN",
+  "TPL-BLACKLIST",
+  "TPL-EXP",
+  "TPL-NODUES",
+] as const;
+
+export type Vars = Record<string, string | number | null | undefined>;
+
+/** Substitute `{{key}}` tokens in a template body. Missing keys render as `—`. */
+export function renderTemplate(body: string, vars: Vars): string {
+  return body.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, key) => {
+    const v = vars[key];
+    if (v === null || v === undefined || v === "") return "—";
+    return String(v);
+  });
+}
+
+/** Extract variable names present in a template body. */
+export function extractVars(body: string): string[] {
+  const set = new Set<string>();
+  const re = /\{\{\s*([\w.-]+)\s*\}\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body))) set.add(m[1]);
+  return [...set];
+}
+
+async function urlToDataUrl(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    return await new Promise((resolve) => {
+      const r = new FileReader();
+      r.onloadend = () => resolve((r.result as string) ?? null);
+      r.onerror = () => resolve(null);
+      r.readAsDataURL(blob);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function resolveStoragePhoto(pathOrUrl?: string | null): Promise<string | null> {
+  if (!pathOrUrl) return null;
+  if (/^https?:\/\//i.test(pathOrUrl) || pathOrUrl.startsWith("data:")) {
+    return urlToDataUrl(pathOrUrl);
+  }
+  // assume worker-documents bucket
+  const { data } = await supabase.storage
+    .from("worker-documents")
+    .createSignedUrl(pathOrUrl, 60 * 5);
+  if (!data?.signedUrl) return null;
+  return urlToDataUrl(data.signedUrl);
+}
+
+export type BuildOptions = {
+  title: string;
+  docNumber?: string;
+  bodyText: string;
+  photoUrl?: string | null;
+  qrPayload?: string; // usually a URL to worker profile
+  companyName?: string;
+  companyTagline?: string;
+};
+
+/** Build a branded A4 PDF and return a Blob. */
+export async function buildPdf(opts: BuildOptions): Promise<Blob> {
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 40;
+
+  // Header band
+  doc.setFillColor(185, 28, 28); // primary red
+  doc.rect(0, 0, W, 70, "F");
+  doc.setTextColor(255, 255, 255);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(20);
+  doc.text(opts.companyName ?? "AIPL", M, 32);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(10);
+  doc.text(opts.companyTagline ?? "Workforce Suite · Aadhaar Infra Pvt Ltd", M, 50);
+
+  // Doc number
+  if (opts.docNumber) {
+    doc.setFontSize(10);
+    doc.text(opts.docNumber, W - M, 32, { align: "right" });
+    doc.setFontSize(8);
+    doc.text(new Date().toLocaleDateString("en-IN"), W - M, 50, { align: "right" });
+  }
+
+  // Title
+  doc.setTextColor(15, 23, 42);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.text(opts.title, M, 110);
+  doc.setDrawColor(226, 232, 240);
+  doc.line(M, 118, W - M, 118);
+
+  // Photo (right)
+  let contentTop = 140;
+  let photoBottom = contentTop;
+  if (opts.photoUrl) {
+    const data = await resolveStoragePhoto(opts.photoUrl);
+    if (data) {
+      try {
+        const size = 90;
+        doc.setDrawColor(200);
+        doc.rect(W - M - size, contentTop, size, size);
+        doc.addImage(data, "JPEG", W - M - size, contentTop, size, size, undefined, "FAST");
+        photoBottom = contentTop + size + 8;
+      } catch {
+        /* ignore image errors */
+      }
+    }
+  }
+
+  // Body
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(11);
+  doc.setTextColor(30, 41, 59);
+  const bodyWidth = opts.photoUrl ? W - 2 * M - 110 : W - 2 * M;
+  const lines = doc.splitTextToSize(opts.bodyText, bodyWidth);
+  doc.text(lines, M, contentTop + 4);
+  const bodyBottom = contentTop + 4 + lines.length * 14;
+
+  // QR (bottom-left)
+  const footerTop = Math.max(bodyBottom, photoBottom) + 40;
+  if (opts.qrPayload) {
+    try {
+      const qrData = await QRCode.toDataURL(opts.qrPayload, { margin: 1, width: 300 });
+      const qrSize = 90;
+      doc.addImage(qrData, "PNG", M, footerTop, qrSize, qrSize);
+      doc.setFontSize(8);
+      doc.setTextColor(100);
+      doc.text("Scan to verify", M, footerTop + qrSize + 12);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Signature area (bottom-right)
+  const sigY = footerTop + 60;
+  doc.setDrawColor(150);
+  doc.line(W - M - 180, sigY, W - M, sigY);
+  doc.setFontSize(10);
+  doc.setTextColor(30, 41, 59);
+  doc.text("Authorised Signatory", W - M - 90, sigY + 14, { align: "center" });
+
+  // Footer
+  doc.setFontSize(8);
+  doc.setTextColor(120);
+  doc.text(
+    `Generated by AIPL Workforce Suite · ${new Date().toLocaleString("en-IN")}`,
+    W / 2,
+    H - 20,
+    { align: "center" },
+  );
+
+  return doc.output("blob");
+}
+
+/** Upload a Blob to `documents` bucket and return the storage path. */
+export async function uploadDocument(blob: Blob, path: string): Promise<string> {
+  const { error } = await supabase.storage
+    .from("documents")
+    .upload(path, blob, { contentType: "application/pdf", upsert: true });
+  if (error) throw error;
+  return path;
+}
+
+export async function getSignedDocUrl(path: string, expiresIn = 60 * 60): Promise<string | null> {
+  const { data } = await supabase.storage.from("documents").createSignedUrl(path, expiresIn);
+  return data?.signedUrl ?? null;
+}
